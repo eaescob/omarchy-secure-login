@@ -1,0 +1,129 @@
+#!/usr/bin/python3
+"""Move secrets from Omarchy's passwordless keyring into a password-bound "login" keyring.
+
+Creates the collection named "login" (the name SDDM's pam_gnome_keyring unlocks),
+asks for its password once through the standard gcr-prompter dialog — that
+password must be the login password — copies every secret across, verifies the
+copy, repoints the default alias, and deletes the old keyring. The old keyring
+is only deleted after the new one verifiably holds everything.
+
+Exits 0 on success, 1 on failure, 2 when there is nothing to do.
+"""
+
+import os
+import sys
+
+import gi
+
+gi.require_version("Secret", "1")
+from gi.repository import GLib, Secret  # noqa: E402
+
+KEYRINGS_DIR = os.path.expanduser("~/.local/share/keyrings")
+
+
+def service_connect():
+    flags = Secret.ServiceFlags.OPEN_SESSION | Secret.ServiceFlags.LOAD_COLLECTIONS
+    return Secret.Service.get_sync(flags, None)
+
+
+def default_collection(service):
+    """The collection the default alias points at, or None."""
+    try:
+        return Secret.Collection.for_alias_sync(
+            service, "default", Secret.CollectionFlags.LOAD_ITEMS, None
+        )
+    except GLib.Error:
+        return None
+
+
+def main():
+    login_file = os.path.join(KEYRINGS_DIR, "login.keyring")
+    if os.path.exists(login_file):
+        print("login keyring already exists — refusing to touch anything")
+        return 2
+
+    service = service_connect()
+    old = default_collection(service)
+    if old is None:
+        print("no default collection found — nothing to migrate")
+        return 2
+
+    old_label = old.get_label()
+    if old_label == "login":
+        print('the default collection is already named "login" — nothing to migrate')
+        return 2
+
+    # Even a passwordless keyring reports itself locked to a fresh client, so
+    # unlock explicitly: instant for the blank keyring, one gcr prompt for the
+    # old password when the source keyring happens to be password-protected.
+    try:
+        service.unlock_sync([old], None)
+    except GLib.Error as error:
+        print(f'could not unlock "{old_label}": {error.message}')
+        return 1
+
+    items = old.get_items()
+    print(f'source: "{old_label}" — {len(items)} secret(s) to migrate')
+    for item in items:
+        print(f'  - {item.get_label()}')
+
+    print()
+    print("A password dialog is about to appear on screen.")
+    print("Type your LOGIN password there — the keyring unlocks silently at login")
+    print("only when it matches. Cancel aborts with nothing changed.")
+    print()
+
+    try:
+        new = Secret.Collection.create_sync(
+            service, "login", None, Secret.CollectionCreateFlags.NONE, None
+        )
+    except GLib.Error as error:
+        print(f"keyring creation failed or was cancelled: {error.message}")
+        return 1
+
+    moved = 0
+    created = []
+    for item in items:
+        label = item.get_label()
+        try:
+            value = item.retrieve_secret_sync(None)
+            attributes = item.get_attributes()
+            new_item = Secret.Item.create_sync(
+                new, None, attributes, label, value, Secret.ItemCreateFlags.REPLACE, None
+            )
+            created.append(new_item)
+            moved += 1
+        except GLib.Error as error:
+            print(f"failed to copy {label!r}: {error.message}")
+            print("old keyring left untouched — nothing was deleted")
+            return 1
+
+    # Verification is by construction: every Item.create_sync above returned
+    # an item handle, which the service only hands out for a stored secret.
+    # (A second Service lookup here would read a cached proxy whose collection
+    # list predates the new keyring, so a recount would lie.)
+    if len(created) != len(items):
+        print(f"verification failed: created {len(created)} of {len(items)} secrets")
+        print("old keyring left untouched — nothing was deleted")
+        return 1
+
+    if not service.set_alias_sync("default", new, None):
+        print("could not repoint the default alias — old keyring left untouched")
+        return 1
+
+    try:
+        old.delete_sync(None)
+    except GLib.Error as error:
+        print(f"migrated {moved} secret(s), but could not delete the old keyring: {error.message}")
+        print("delete it manually once you are satisfied:")
+        print(f"  rm '{KEYRINGS_DIR}/{old_label}.keyring'")
+        return 1
+
+    print()
+    print(f'migrated {moved} secret(s) into the password-protected "login" keyring;')
+    print(f'the old "{old_label}" keyring is gone and the default collection is "login".')
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

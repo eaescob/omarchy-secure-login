@@ -1,0 +1,363 @@
+#!/bin/bash
+
+# omarchy-secure-login — opt-in secure login for Omarchy.
+#
+# What it changes, each piece reversible with `uninstall`:
+#   1. Autologin is disabled: SDDM asks for your password at every login.
+#   2. The keyring is rebound to your login password: the default collection
+#      becomes "login", its secrets are copied out of the passwordless keyring
+#      Omarchy ships, and SDDM's PAM stack is restored so the keyring unlocks
+#      silently the moment you type your password.
+#   3. If a fingerprint reader is enrolled, the login screen accepts your
+#      finger (and Omarchy's lock screen gets fingerprint unlock too).
+#
+# Tradeoff to know: a fingerprint login carries no password, so the keyring
+# stays locked that session until an app asks — you'll get one unlock prompt.
+# Password logins unlock it silently.
+
+set -euo pipefail
+
+STATE_DIR=/var/lib/omarchy-secure-login
+PAM_FILE=/etc/pam.d/sddm
+AUTOLOGIN=/etc/sddm.conf.d/autologin.conf
+KEYRINGS="$HOME/.local/share/keyrings"
+
+BIN_DIR=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
+MIGRATE="$BIN_DIR/omarchy-secure-login-keyring-migrate"
+[[ -x $MIGRATE ]] || MIGRATE=$(command -v omarchy-secure-login-keyring-migrate 2>/dev/null || true)
+
+GREEN=$'\e[32m'
+YELLOW=$'\e[33m'
+RED=$'\e[31m'
+BOLD=$'\e[1m'
+RESET=$'\e[0m'
+
+ok() { echo -e "${GREEN}✓${RESET} $*"; }
+warn() { echo -e "${YELLOW}!${RESET} $*" >&2; }
+die() { echo -e "${RED}error:${RESET} $*" >&2; exit 1; }
+step() { echo -e "${BOLD}::$RESET $*" >&2; }
+
+usage() {
+  cat <<USAGE
+${BOLD}omarchy-secure-login${RESET} — opt-in secure login for Omarchy.
+
+  omarchy-secure-login                 interactive setup wizard
+  omarchy-secure-login --yes           apply everything without prompts
+  omarchy-secure-login --no-fingerprint  apply without touching SDDM's fingerprint line
+  omarchy-secure-login status          show the current state of every piece
+  omarchy-secure-login uninstall       restore autologin and the stock PAM stack
+
+The keyring stays bound after uninstall (rebinding back to a passwordless
+keyring is a manual step — see the README).
+USAGE
+}
+
+# ---- detection ---------------------------------------------------------------
+
+autologin_enabled() {
+  [[ -f $AUTOLOGIN ]]
+}
+
+fingerprint_enrolled() {
+  command -v fprintd-list >/dev/null 2>&1 || return 1
+  fprintd-list "$USER" 2>/dev/null | grep -qi finger
+}
+
+pam_has() {
+  grep -qE "$1" "$PAM_FILE"
+}
+
+# The default collection's name, from the alias file (missing file means the
+# upstream default: the collection named "login").
+default_keyring_name() {
+  if [[ -f $KEYRINGS/default ]]; then
+    cat "$KEYRINGS/default"
+  else
+    echo "login"
+  fi
+}
+
+# gnome-keyring 50 writes password-protected keyrings in a binary format
+# (magic "GnomeKeyring\n\0"); only passwordless keyrings keep the legacy text
+# format. Bound means: a login keyring exists AND it is not the passwordless
+# text format.
+keyring_is_bound() {
+  [[ -f $KEYRINGS/login.keyring ]] || return 1
+  if head -c 12 "$KEYRINGS/login.keyring" | grep -q "GnomeKeyring"; then
+    return 0
+  fi
+  (( $(grep -c hashed-password "$KEYRINGS/login.keyring" 2>/dev/null || echo 0) > 0 ))
+}
+
+# Secret count of the default collection. The text format can be counted from
+# the file; the binary format needs the running service.
+keyring_item_count() {
+  local file="$KEYRINGS/$(default_keyring_name).keyring"
+  if [[ ! -f $file ]]; then
+    echo 0
+  elif head -c 12 "$file" | grep -q "GnomeKeyring"; then
+    DBUS_SESSION_BUS_ADDRESS="${DBUS_SESSION_BUS_ADDRESS:-unix:path=${XDG_RUNTIME_DIR:-/run/user/$UID}/bus}" \
+      python3 -c 'import gi; gi.require_version("Secret", "1"); from gi.repository import Secret
+s = Secret.Service.get_sync(Secret.ServiceFlags.LOAD_COLLECTIONS, None)
+for c in s.get_collections():
+  try:
+    if c.get_label() == "login": print(len(c.get_items())); break
+  except Exception: pass
+else: print(0)' 2>/dev/null || echo "?"
+  else
+    grep -cE '^\[[0-9]+\]' "$file" || echo 0
+  fi
+}
+
+on_omarchy() {
+  [[ -n ${OMARCHY_PATH:-} ]] || [[ -d /usr/share/omarchy ]]
+}
+
+# ---- system pieces (sudo) ----------------------------------------------------
+
+disable_autologin() {
+  if ! autologin_enabled; then
+    ok "autologin already disabled"
+    return 0
+  fi
+  step "disabling autologin (backup kept in $STATE_DIR)"
+  sudo mkdir -p "$STATE_DIR"
+  sudo cp "$AUTOLOGIN" "$STATE_DIR/autologin.conf.bak"
+  sudo rm "$AUTOLOGIN"
+  ok "autologin disabled — SDDM will ask for your password"
+}
+
+restore_autologin() {
+  if [[ -f $STATE_DIR/autologin.conf.bak ]]; then
+    sudo mkdir -p "$(dirname "$AUTOLOGIN")"
+    sudo cp "$STATE_DIR/autologin.conf.bak" "$AUTOLOGIN"
+    sudo rm "$STATE_DIR/autologin.conf.bak"
+    ok "autologin restored"
+  elif [[ -f $AUTOLOGIN ]]; then
+    ok "autologin already present"
+  else
+    warn "no autologin backup found and none is configured — nothing to restore"
+  fi
+}
+
+ensure_pam_keyring() {
+  step "wiring SDDM's PAM stack to unlock the keyring with your password"
+  local changed=0
+  if ! pam_has '^-auth[[:space:]]+optional[[:space:]]+pam_gnome_keyring\.so'; then
+    sudo sed -i '/^auth[[:space:]]*include[[:space:]]*system-login$/a -auth       optional    pam_gnome_keyring.so' "$PAM_FILE"
+    changed=1
+  fi
+  if ! pam_has '^-password[[:space:]]+optional[[:space:]]+pam_gnome_keyring\.so'; then
+    sudo sed -i '/^password[[:space:]]*include[[:space:]]*system-login$/a -password   optional    pam_gnome_keyring.so' "$PAM_FILE"
+    changed=1
+  fi
+  if (( changed )); then
+    ok "pam_gnome_keyring auth/password lines added to $PAM_FILE"
+  else
+    ok "PAM keyring lines already present"
+  fi
+}
+
+strip_pam_keyring() {
+  sudo sed -i -E '/^-auth[[:space:]]+optional[[:space:]]+pam_gnome_keyring\.so/d; /^-password[[:space:]]+optional[[:space:]]+pam_gnome_keyring\.so/d' "$PAM_FILE"
+  ok "PAM keyring lines removed"
+}
+
+ensure_pam_fprintd() {
+  if ! pam_has '^auth[[:space:]]+sufficient[[:space:]]+pam_fprintd\.so'; then
+    sudo sed -i '0,/^auth[[:space:]]*include[[:space:]]*system-login$/i auth        sufficient  pam_fprintd.so' "$PAM_FILE"
+    ok "fingerprint unlock enabled at the login screen"
+  else
+    ok "login-screen fingerprint already enabled"
+  fi
+  # The Omarchy lock screen has its own PAM service for fingers; wire it too.
+  if command -v omarchy-apply-lock >/dev/null 2>&1; then
+    sudo omarchy-apply-lock >/dev/null 2>&1 || warn "omarchy-apply-lock failed — lock-screen fingerprint may not be wired"
+  fi
+}
+
+strip_pam_fprintd() {
+  sudo sed -i -E '/^auth[[:space:]]+sufficient[[:space:]]+pam_fprintd\.so/d' "$PAM_FILE"
+  ok "login-screen fingerprint line removed"
+}
+
+# ---- keyring migration (user, graphical session) ------------------------------
+
+migrate_keyring() {
+  if keyring_is_bound; then
+    ok "keyring already bound to the login password"
+    return 0
+  fi
+  [[ -n $MIGRATE ]] || die "migration helper not found (expected $BIN_DIR/omarchy-secure-login-keyring-migrate)"
+  step "migrating the keyring — a password dialog will appear on screen"
+  echo "  ${BOLD}Type your LOGIN password into the dialog.${RESET} The keyring unlocks" >&2
+  echo "  silently at login only when the keyring password matches it." >&2
+  # The dialog is rendered by the session daemon regardless of where this runs
+  # from, but the script still needs the session bus — default it for SSH contexts.
+  export DBUS_SESSION_BUS_ADDRESS="${DBUS_SESSION_BUS_ADDRESS:-unix:path=${XDG_RUNTIME_DIR:-/run/user/$UID}/bus}"
+  "$MIGRATE"
+  ok "secrets now live in the encrypted login keyring"
+}
+
+# ---- flow ---------------------------------------------------------------------
+
+do_apply() {
+  local yes=$1 fingerprints=$2
+
+  on_omarchy || warn "this doesn't look like an Omarchy machine — continuing anyway"
+  [[ -f $PAM_FILE ]] || die "SDDM PAM file not found at $PAM_FILE (SDDM required)"
+  [[ $EUID -ne 0 ]] || die "run as your own user, not root — the keyring migration must touch your session"
+
+  echo -e "${BOLD}Secure login setup${RESET}"
+  echo "  1. Disable autologin      $([[ $(autologin_enabled && echo yes || echo no) == yes ]] && echo '(currently enabled)' || echo '(already off)')"
+  echo "  2. Bind keyring to login  $([[ $(keyring_is_bound && echo yes || echo no) == yes ]] && echo '(already bound)' || echo "($(keyring_item_count) secrets to migrate)")"
+  if [[ $fingerprints == auto ]]; then
+    if fingerprint_enrolled; then
+      echo "  3. Fingerprint at login   (reader enrolled — will enable)"
+    fi
+  elif [[ $fingerprints == force ]]; then
+    echo "  3. Fingerprint at login   (enabled on request)"
+  fi
+  echo
+
+  if (( ! yes )); then
+    if ! command -v gum >/dev/null 2>&1; then
+      die "gum not found — install it or rerun with --yes"
+    fi
+    gum confirm "Apply secure login?" || { echo "Aborted. Nothing changed."; exit 1; }
+  fi
+
+  disable_autologin
+  ensure_pam_keyring
+
+  local use_fingerprint=1
+  if [[ $fingerprints == never ]]; then
+    use_fingerprint=0
+  elif (( ! yes )) && [[ $fingerprints == auto ]]; then
+    use_fingerprint=0
+    fingerprint_enrolled && command -v gum >/dev/null 2>&1 && gum confirm "Enable fingerprint unlock at the login screen?" && use_fingerprint=1
+  fi
+
+  if (( use_fingerprint )); then
+    if [[ $fingerprints == auto ]] && ! fingerprint_enrolled; then
+      warn "no enrolled fingerprints — skipping (enroll with fprintd-enroll and rerun)"
+    else
+      ensure_pam_fprintd
+    fi
+  fi
+
+  migrate_keyring
+
+  echo
+  ok "done. Next login: type your password at SDDM (or use your finger) —"
+  echo "  the keyring unlocks silently with password logins."
+  echo "  Everything is reversible: omarchy-secure-login uninstall"
+
+  command -v omarchy-notification-send >/dev/null 2>&1 &&
+    omarchy-notification-send -g 󰷏 "Secure login enabled" "Password required at the login screen; keyring bound to it." || true
+}
+
+do_uninstall() {
+  local yes=$1
+  # All pieces are system-side (root-writable files), so root is fine here —
+  # and unlike over ssh, a real terminal's sudo cache makes either way work.
+  if (( ! yes )); then
+    if [[ $EUID == 0 ]] || command -v gum >/dev/null 2>&1; then
+      : # --yes or root needs no prompt
+    fi
+    if [[ $EUID != 0 ]] && command -v gum >/dev/null 2>&1; then
+      gum confirm "Restore autologin and the stock PAM stack?" || { echo "Aborted. Nothing changed."; exit 1; }
+    fi
+  fi
+  if [[ $EUID == 0 ]]; then
+    sudo() { "$@"; }
+  fi
+  restore_autologin
+  strip_pam_fprintd
+  strip_pam_keyring
+  echo
+  warn "the login keyring stays bound to your password (secrets stay encrypted)"
+  echo "  Omarchy's passwordless keyring bootstrap can be restored manually — see README."
+}
+
+do_status() {
+  echo -e "${BOLD}autologin${RESET}"
+  if autologin_enabled; then
+    echo "  enabled — SDDM logs you in without a password"
+  else
+    echo "  disabled — SDDM asks for your password"
+  fi
+
+  echo -e "${BOLD}sddm keyring unlock${RESET}"
+  if pam_has '^-auth[[:space:]]+optional[[:space:]]+pam_gnome_keyring\.so'; then
+    echo "  configured — keyring unlocks with password login"
+  else
+    echo "  not configured — keyring never unlocks via PAM"
+  fi
+
+  echo -e "${BOLD}login-screen fingerprint${RESET}"
+  if pam_has '^auth[[:space:]]+sufficient[[:space:]]+pam_fprintd\.so'; then
+    echo "  enabled at SDDM$(fingerprint_enrolled && echo ' (finger enrolled)' || echo ' — but no finger is enrolled!')"
+  elif fingerprint_enrolled; then
+    echo "  finger enrolled, but not enabled at SDDM"
+  else
+    echo "  not configured (no enrolled fingers)"
+  fi
+
+  echo -e "${BOLD}keyring${RESET}"
+  if keyring_is_bound; then
+    echo "  bound: login keyring is password-protected ($(keyring_item_count) secrets)"
+  else
+    local name
+    name=$(default_keyring_name)
+    echo "  unbound: default collection \"$name\" has $(keyring_item_count) secrets$(grep -q hashed-password "$KEYRINGS/$name.keyring" 2>/dev/null && echo ' (password-protected)' || echo ' — stored WITHOUT a password')"
+  fi
+}
+
+# ---- entry --------------------------------------------------------------------
+
+subcommand=""
+yes=0
+fingerprints=auto
+
+while (($# > 0)); do
+  case $1 in
+    status | uninstall)
+      subcommand=$1
+      shift
+      ;;
+    --yes)
+      yes=1
+      shift
+      ;;
+    --no-fingerprint)
+      fingerprints=never
+      shift
+      ;;
+    --fingerprint)
+      fingerprints=force
+      shift
+      ;;
+    -h | --help | help)
+      usage
+      exit 0
+      ;;
+    *)
+      usage >&2
+      die "unknown argument: $1"
+      ;;
+  esac
+done
+
+case $subcommand in
+status)
+  do_status
+  ;;
+uninstall)
+  do_uninstall "$yes"
+  ;;
+*)
+  (( EUID == 0 )) && die "run apply as your own user, not root — the keyring migration must touch your session"
+  do_apply "$yes" "$fingerprints"
+  ;;
+esac
