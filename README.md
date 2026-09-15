@@ -2,6 +2,50 @@
 
 Opt-in secure login for [Omarchy](https://omarchy.org): turn off autologin, bind the secret keyring to your login password, and use your fingerprint at the login screen if a reader is enrolled. Everything is reversible, and nothing changes until you run it.
 
+## The new login experience
+
+Every screenshot below is real: captured by the [QEMU validation run](#validation) on a disposable Omarchy VM using the stock Omarchy 4.0.3 ISO with the default theme — no mockups.
+
+**Before:** an encrypted Omarchy install boots through the LUKS prompt and logs you straight into the desktop, forever, without asking anything.
+
+**After:** the default Omarchy greeter waits for your password instead of autologging in —
+
+<p align="center">
+  <img src="screenshots/03-sddm-login.png" alt="The default Omarchy SDDM greeter asking for a password after secure login was enabled" width="720">
+  <br><em>The stock Omarchy login screen — now it actually asks. <code>loginctl</code> proves no session
+  was auto-created: the greeter holds the seat.</em>
+</p>
+
+Setup takes one command and one dialog. `omarchy-secure-login` walks the machine through each piece —
+
+<p align="center">
+  <img src="screenshots/01-setup-terminal.png" alt="omarchy-secure-login running in a terminal: disabling autologin, wiring PAM, migrating the keyring" width="720">
+  <br><em>The wizard in the default Omarchy terminal: autologin disabled, SDDM's PAM stack wired to
+  unlock the keyring, secrets migrating out of the passwordless keyring.</em>
+</p>
+
+<p align="center">
+  <img src="screenshots/02-keyring-password-dialog.png" alt="The standard gcr dialog asking to choose a password for the new login keyring" width="720">
+  <br><em>The one dialog you type your login password into — it goes straight to the keyring daemon,
+  never through the tool. Secrets are copied into the new encrypted keyring, verified, and only then
+  is the old passwordless one deleted.</em>
+</p>
+
+After typing your password at the greeter, the desktop comes up exactly as before — but the keyring
+already unlocked with that keystroke, silently, via PAM:
+
+<p align="center">
+  <img src="screenshots/04-desktop-after-login.png" alt="The Omarchy desktop after a password login, indistinguishable from an autologin session" width="720">
+  <br><em>Same desktop, same default theme — plus an encrypted keyring that unlocked with your login.</em>
+</p>
+
+And `omarchy-secure-login status` always tells you where you stand:
+
+<p align="center">
+  <img src="screenshots/05-status.png" alt="omarchy-secure-login status showing autologin disabled, keyring unlock configured, and the keyring bound" width="720">
+  <br><em>Every piece of the setup, reported.</em>
+</p>
+
 ## Why
 
 Omarchy's defaults trade a boundary for zero prompts: on encrypted installs SDDM autologins forever ("the LUKS prompt is the auth boundary"), and the shipped keyring has **no password at all** — secrets (gh credentials, browser keys, 2FA seeds) sit unencrypted in `~/.local/share/keyrings/` and any process running as your user can read them, forever, without ever knowing a secret.
@@ -54,13 +98,13 @@ cd ../omarchy && ./test/vm install lab   # once: golden encrypted Omarchy base
 cd ../omarchy-secure-login && ./test/validate.sh
 ```
 
-`validate.sh` boots a fresh VM from the base, seeds test secrets, runs the utility end-to-end (typing the VM's password into the real gcr dialog over QMP), verifies every file it touched, reboots to capture the changed login experience, logs in at the SDDM greeter, and proves the keyring unlocked silently with that password. The evidence set lands in `screenshots/`:
+`validate.sh` boots a fresh VM from the base, seeds test secrets, runs the utility end-to-end (typing the VM's password into the real gcr dialog over QMP), verifies every file it touched, reboots to capture the changed login experience, logs in at the SDDM greeter, and proves the keyring unlocked silently with that password. The screenshots embedded above are exactly the files that run captures:
 
-- `01-setup-terminal.png` — the wizard's summary after a successful run
-- `02-keyring-password-dialog.png` — the one dialog you type your login password into
-- `03-sddm-login.png` — the changed boot experience: the default Omarchy greeter asking for a password instead of autologging in
-- `04-desktop-after-login.png` — the desktop after password login, keyring already unlocked
-- `05-status.png` — `omarchy-secure-login status`
+- `screenshots/01-setup-terminal.png` — the wizard's summary after a successful run
+- `screenshots/02-keyring-password-dialog.png` — the one dialog you type your login password into
+- `screenshots/03-sddm-login.png` — the changed boot experience: the default Omarchy greeter asking for a password instead of autologging in
+- `screenshots/04-desktop-after-login.png` — the desktop after password login, keyring already unlocked
+- `screenshots/05-status.png` — `omarchy-secure-login status`
 
 It finishes by running `uninstall` and verifying the restoration. Limitations that cannot be exercised in QEMU: real fingerprint readers (the config path is validated by stubbing enrollment; hardware behavior is on the reader), and Bluetooth-class attacks (unrelated to this tool).
 
