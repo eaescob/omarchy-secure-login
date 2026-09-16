@@ -25,6 +25,9 @@ KEYRINGS="$HOME/.local/share/keyrings"
 BIN_DIR=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
 MIGRATE="$BIN_DIR/omarchy-secure-login-keyring-migrate"
 [[ -x $MIGRATE ]] || MIGRATE=$(command -v omarchy-secure-login-keyring-migrate 2>/dev/null || true)
+UNLOCK_SRC="$BIN_DIR/omarchy-secure-login-keyring-unlock"
+UNLOCK_DST=/usr/local/libexec/omarchy-secure-login-keyring-unlock
+PASS_FILE=$STATE_DIR/keyring-pass
 
 GREEN=$'\e[32m'
 YELLOW=$'\e[33m'
@@ -113,6 +116,10 @@ on_omarchy() {
   [[ -n ${OMARCHY_PATH:-} ]] || [[ -d /usr/share/omarchy ]]
 }
 
+auto_unlock_enabled() {
+  grep -q "omarchy-secure-login-keyring-unlock" "$PAM_FILE" 2>/dev/null
+}
+
 # ---- system pieces (sudo) ----------------------------------------------------
 
 disable_autologin() {
@@ -181,6 +188,56 @@ strip_pam_fprintd() {
   ok "login-screen fingerprint line removed"
 }
 
+# ---- fingerprint auto-unlock (opt-in, root-stored password) ---------------------
+
+# A fingerprint login produces no password, so PAM cannot unlock the keyring
+# and an unlock prompt appears at first secret use. This opt-in mode stores
+# the keyring password in a root-only file and feeds it to the daemon at SDDM
+# login via pam_exec, so fingerprint logins arrive at an unlocked keyring.
+# The file is a plaintext copy of the login password (which on Omarchy is
+# also the LUKS passphrase and the sudo password) — root-only, inside the
+# encrypted disk, but a real weakening. Never enabled without explicit consent.
+enable_auto_unlock() {
+  if auto_unlock_enabled && [[ -f $UNLOCK_DST && -f $PASS_FILE ]]; then
+    ok "keyring auto-unlock already configured"
+    return 0
+  fi
+
+  echo "  ${BOLD}This stores your keyring password in a root-only file${RESET} ($PASS_FILE)." >&2
+  echo "  On Omarchy that password also unlocks your disk and sudo. It sits inside" >&2
+  echo "  your encrypted disk and only root can read it — but it is a plaintext" >&2
+  echo "  copy of a high-value secret. It is only ever fed to your own keyring" >&2
+  echo "  daemon at the SDDM graphical login, never to ssh or cron sessions." >&2
+  echo
+
+  command -v gum >/dev/null 2>&1 || die "gum not found — auto-unlock needs a terminal prompt"
+  local pw confirm
+  pw=$(gum input --password --prompt "Keyring password> " --placeholder "Your login password") || return 1
+  confirm=$(gum input --password --prompt "Confirm> ") || return 1
+  [[ $pw == "$confirm" ]] || { warn "passwords did not match"; return 1; }
+  [[ -n $pw ]] || { warn "password cannot be empty"; return 1; }
+
+  sudo mkdir -p "$STATE_DIR" /usr/local/libexec
+  # Create the file with mode 600 before writing, so the password is never
+  # briefly world-readable through tee's default mode.
+  sudo install -m 600 -o root -g root /dev/null "$PASS_FILE"
+  printf '%s\n' "$pw" | sudo tee "$PASS_FILE" >/dev/null
+  sudo install -m 755 "$UNLOCK_SRC" "$UNLOCK_DST"
+
+  if ! grep -q "omarchy-secure-login-keyring-unlock" "$PAM_FILE"; then
+    sudo sed -i '/^-session[[:space:]]*optional[[:space:]]*pam_gnome_keyring\.so[[:space:]]*auto_start$/a -session    optional    pam_exec.so quiet '"$UNLOCK_DST" "$PAM_FILE"
+  fi
+  ok "keyring auto-unlock configured (fingerprint logins unlock the keyring)"
+}
+
+disable_auto_unlock() {
+  if grep -q "omarchy-secure-login-keyring-unlock" "$PAM_FILE"; then
+    sudo sed -i '\|omarchy-secure-login-keyring-unlock|d' "$PAM_FILE"
+  fi
+  sudo rm -f "$UNLOCK_DST" "$PASS_FILE"
+  ok "keyring auto-unlock removed (stored password deleted)"
+}
+
 # ---- keyring migration (user, graphical session) ------------------------------
 
 migrate_keyring() {
@@ -202,7 +259,7 @@ migrate_keyring() {
 # ---- flow ---------------------------------------------------------------------
 
 do_apply() {
-  local yes=$1 fingerprints=$2
+  local yes=$1 fingerprints=$2 auto_unlock=$3
 
   on_omarchy || warn "this doesn't look like an Omarchy machine — continuing anyway"
   [[ -f $PAM_FILE ]] || die "SDDM PAM file not found at $PAM_FILE (SDDM required)"
@@ -248,6 +305,17 @@ do_apply() {
 
   migrate_keyring
 
+  # Auto-unlock is only useful for fingerprint logins — password logins
+  # already unlock the keyring silently via PAM. Explicit flag, or an
+  # interactive yes; --yes alone never enables it.
+  if (( auto_unlock )); then
+    enable_auto_unlock || warn "auto-unlock was not configured"
+  elif (( ! yes )) && fingerprint_enrolled && command -v gum >/dev/null 2>&1; then
+    if gum confirm "Also unlock the keyring automatically for fingerprint logins? (stores the keyring password in a root-only file)"; then
+      enable_auto_unlock || warn "auto-unlock was not configured"
+    fi
+  fi
+
   echo
   ok "done. Next login: type your password at SDDM (or use your finger) —"
   echo "  the keyring unlocks silently with password logins."
@@ -272,6 +340,7 @@ do_uninstall() {
   if [[ $EUID == 0 ]]; then
     sudo() { "$@"; }
   fi
+  disable_auto_unlock
   restore_autologin
   strip_pam_fprintd
   strip_pam_keyring
@@ -304,6 +373,17 @@ do_status() {
     echo "  not configured (no enrolled fingers)"
   fi
 
+  echo -e "${BOLD}keyring auto-unlock${RESET}"
+  if auto_unlock_enabled; then
+    if [[ -f $PASS_FILE && -f $UNLOCK_DST ]]; then
+      echo "  enabled — fingerprint logins unlock the keyring (password stored root-only)"
+    else
+      echo "  half-configured — PAM line present but pieces missing (rerun setup)"
+    fi
+  else
+    echo "  disabled"
+  fi
+
   echo -e "${BOLD}keyring${RESET}"
   if keyring_is_bound; then
     echo "  bound: login keyring is password-protected ($(keyring_item_count) secrets)"
@@ -319,6 +399,7 @@ do_status() {
 subcommand=""
 yes=0
 fingerprints=auto
+auto_unlock=0
 
 while (($# > 0)); do
   case $1 in
@@ -332,6 +413,10 @@ while (($# > 0)); do
       ;;
     --no-fingerprint)
       fingerprints=never
+      shift
+      ;;
+    --keyring-auto-unlock)
+      auto_unlock=1
       shift
       ;;
     --fingerprint)
@@ -358,6 +443,6 @@ uninstall)
   ;;
 *)
   (( EUID == 0 )) && die "run apply as your own user, not root — the keyring migration must touch your session"
-  do_apply "$yes" "$fingerprints"
+  do_apply "$yes" "$fingerprints" "$auto_unlock"
   ;;
 esac

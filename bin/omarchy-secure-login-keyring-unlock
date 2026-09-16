@@ -1,0 +1,36 @@
+#!/bin/bash
+
+# omarchy-secure-login-keyring-unlock — called by pam_exec at session open.
+#
+# Fingerprint logins carry no password, so PAM cannot unlock the keyring
+# (pam_gnome_keyring needs the typed password). When the opt-in auto-unlock
+# mode is enabled, this hook feeds the stored keyring password to the user's
+# running keyring daemon through the documented `gnome-keyring-daemon
+# --unlock` stdin path, so a fingerprint login still arrives at an unlocked
+# keyring.
+#
+# Deliberately narrow:
+#   - only runs for the SDDM graphical login (PAM_SERVICE=sddm) — never for
+#     ssh, su, or cron sessions, so a headless session can't trigger it;
+#   - only acts when the daemon's control socket already exists, meaning the
+#     session daemon started (the pam_gnome_keyring auto_start line runs
+#     before this hook in the session stack);
+#   - always exits 0: a PAM `optional` module must never block login.
+
+set -uo pipefail
+
+PASS_FILE=/var/lib/omarchy-secure-login/keyring-pass
+
+[[ ${PAM_SERVICE:-} == "sddm" ]] || exit 0
+[[ -r $PASS_FILE && -n ${PAM_USER:-} ]] || exit 0
+
+uid=$(id -u "$PAM_USER" 2>/dev/null) || exit 0
+[[ -S /run/user/$uid/keyring/control ]] || exit 0
+
+# The daemon reads the login keyring password from stdin. Send it terminated
+# by EOF so --unlock never falls back to prompting; a timeout guards against a
+# wedged control socket ever stalling the login path.
+XDG_RUNTIME_DIR="/run/user/$uid" timeout 5 gnome-keyring-daemon --unlock \
+  <"$PASS_FILE" >/dev/null 2>&1 || true
+
+exit 0
