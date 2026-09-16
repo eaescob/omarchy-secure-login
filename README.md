@@ -63,9 +63,28 @@ The keyring can only be unlocked with a *password*. When you log in with your fi
 | Login method | Keyring |
 | --- | --- |
 | Password at SDDM | Unlocks silently with the login — zero prompts |
-| Fingerprint at SDDM | Stays locked; one "Unlock Login Keyring" dialog at the first app that needs a secret |
+| Fingerprint at SDDM | Stays locked; one "Unlock Login Keyring" dialog at the first app that needs a secret — unless auto-unlock is enabled (below) |
 
-That dialog is inherent to how PAM and the keyring interact (stock GNOME behaves the same). Both paths are still better than the default: secrets are encrypted at rest either way.
+The fingerprint prompt is inherent to how PAM and the keyring interact (stock GNOME behaves the same): a fingerprint produces a yes/no, never secret material, so nothing exists to decrypt the keyring with. Both paths are still better than the default: secrets are encrypted at rest either way.
+
+### Optional: auto-unlock for fingerprint logins
+
+For people who want fingerprint logins *and* a silent keyring, the utility offers an explicit opt-in:
+
+```
+omarchy-secure-login --keyring-auto-unlock
+```
+
+This stores the keyring password in a root-only file (`/var/lib/omarchy-secure-login/keyring-pass`, mode 600) and adds a `pam_exec` session hook to SDDM that feeds it to your keyring daemon through its own control protocol — the same wire format `pam_gnome_keyring` uses. A fingerprint login then arrives at an already-unlocked keyring, with no dialog.
+
+Know exactly what this trades:
+
+- **The file is a plaintext copy of your keyring password** — which on Omarchy is also your LUKS passphrase and your sudo password. Root-only, inside your encrypted disk, deleted by `uninstall`, but a real weakening compared to only hashes in `/etc/shadow`.
+- The hook only fires for the SDDM graphical login (`PAM_SERVICE=sddm`), never for ssh, su, or cron sessions — a headless login cannot trigger the unlock.
+- It is never enabled by default: `--yes` alone will not turn it on. The wizard asks, and the flag is the unattended consent.
+- If the stored password ever stops matching (you changed your login password), the hook fails closed — the stock unlock prompt appears at first secret use, exactly as without the feature.
+
+`uninstall` removes the PAM hook, the hook script, and deletes the stored password file. The keyring itself stays bound, as always.
 
 ## What changes, exactly
 

@@ -1,36 +1,97 @@
-#!/bin/bash
+#!/usr/bin/python3
+"""omarchy-secure-login-keyring-unlock — pam_exec hook at SDDM session open.
 
-# omarchy-secure-login-keyring-unlock — called by pam_exec at session open.
-#
-# Fingerprint logins carry no password, so PAM cannot unlock the keyring
-# (pam_gnome_keyring needs the typed password). When the opt-in auto-unlock
-# mode is enabled, this hook feeds the stored keyring password to the user's
-# running keyring daemon through the documented `gnome-keyring-daemon
-# --unlock` stdin path, so a fingerprint login still arrives at an unlocked
-# keyring.
-#
-# Deliberately narrow:
-#   - only runs for the SDDM graphical login (PAM_SERVICE=sddm) — never for
-#     ssh, su, or cron sessions, so a headless session can't trigger it;
-#   - only acts when the daemon's control socket already exists, meaning the
-#     session daemon started (the pam_gnome_keyring auto_start line runs
-#     before this hook in the session stack);
-#   - always exits 0: a PAM `optional` module must never block login.
+Fingerprint logins carry no password, so PAM cannot unlock the keyring (the
+pam_gnome_keyring path needs the typed password). When the opt-in auto-unlock
+mode is enabled, this hook speaks gnome-keyring's control-socket protocol —
+the same wire format pam_gnome_keyring itself uses — and feeds the stored
+keyring password to the user's running daemon, so a fingerprint login still
+arrives at an unlocked keyring.
 
-set -uo pipefail
+Deliberately narrow:
+  - only runs for the SDDM graphical login (PAM_SERVICE=sddm) — never for
+    ssh, su, or cron sessions, so a headless session can't trigger it;
+  - waits for the session daemon's control socket for a bounded time, since
+    the pam_gnome_keyring auto_start line may spawn it asynchronously;
+  - always exits 0: a PAM `optional` module must never block login.
 
-PASS_FILE=/var/lib/omarchy-secure-login/keyring-pass
+Protocol (daemon/control/gkd-control-codes.h, pam/gkr-pam-client.c):
+  request:  BE uint32 total-length, BE uint32 opcode (1 = UNLOCK),
+            BE uint32 password-length, raw password bytes
+  response: BE uint32 total-length, BE uint32 result (0 = OK)
+"""
 
-[[ ${PAM_SERVICE:-} == "sddm" ]] || exit 0
-[[ -r $PASS_FILE && -n ${PAM_USER:-} ]] || exit 0
+import os
+import pwd
+import socket
+import struct
+import sys
+import time
 
-uid=$(id -u "$PAM_USER" 2>/dev/null) || exit 0
-[[ -S /run/user/$uid/keyring/control ]] || exit 0
+PASS_FILE = "/var/lib/omarchy-secure-login/keyring-pass"
+OP_UNLOCK = 1
+RESULT_OK = 0
+SOCKET_WAIT_SECONDS = 10
 
-# The daemon reads the login keyring password from stdin. Send it terminated
-# by EOF so --unlock never falls back to prompting; a timeout guards against a
-# wedged control socket ever stalling the login path.
-XDG_RUNTIME_DIR="/run/user/$uid" timeout 5 gnome-keyring-daemon --unlock \
-  <"$PASS_FILE" >/dev/null 2>&1 || true
 
-exit 0
+def main():
+    if os.environ.get("PAM_SERVICE") != "sddm":
+        return 0
+    pam_user = os.environ.get("PAM_USER")
+    if not pam_user:
+        return 0
+    try:
+        uid = pwd.getpwnam(pam_user).pw_uid
+    except KeyError:
+        return 0
+
+    sock_path = f"/run/user/{uid}/keyring/control"
+    deadline = time.monotonic() + SOCKET_WAIT_SECONDS
+    while not os.path.exists(sock_path):
+        if time.monotonic() >= deadline:
+            return 0  # daemon never came up — the prompt path still works
+        time.sleep(0.25)
+
+    try:
+        with open(PASS_FILE, "rb") as handle:
+            password = handle.read().rstrip(b"\n")
+    except OSError:
+        return 0
+
+    # The leading uint32 counts the whole packet INCLUDING itself (see
+    # pam/gkr-pam-client.c: oplen = 8 + per-arg (4 + len)) — one byte-level
+    # mistake here fails silently, so it is worth the comment.
+    body = struct.pack(">II", OP_UNLOCK, len(password)) + password
+    request = struct.pack(">I", len(body) + 4) + body
+
+    # The daemon only accepts connections carrying the SESSION USER's
+    # credentials (pam/gkr-pam-client.c write_credentials_byte: a 1-byte
+    # write whose kernel-attached SCM data identifies the client). pam_exec
+    # runs us as root, so after reading the root-only password file, drop to
+    # the user before the exchange and send the credentials byte first.
+    try:
+        entry = pwd.getpwnam(pam_user)
+        os.setgid(entry.pw_gid)
+        os.setuid(entry.pw_uid)
+    except (KeyError, OSError):
+        return 0
+
+    try:
+        with socket.socket(socket.AF_UNIX) as sock:
+            sock.settimeout(5)
+            sock.connect(sock_path)
+            sock.sendall(b"\x00" + request)
+            response = sock.recv(8)
+    except OSError:
+        return 0
+
+    if len(response) < 8 or struct.unpack(">I", response[4:])[0] != RESULT_OK:
+        # Wrong stored password or a daemon hiccup: the stock behavior takes
+        # over — the first app that needs a secret shows the unlock prompt.
+        pass
+
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
