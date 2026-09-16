@@ -197,18 +197,35 @@ strip_pam_fprintd() {
 # The file is a plaintext copy of the login password (which on Omarchy is
 # also the LUKS passphrase and the sudo password) — root-only, inside the
 # encrypted disk, but a real weakening. Never enabled without explicit consent.
+print_auto_unlock_warning() {
+  echo >&2
+  echo -e "${RED}${BOLD}⚠  WARNING — fingerprint keyring auto-unlock${RESET}" >&2
+  echo "  This stores your keyring password as PLAINTEXT in a root-only file:" >&2
+  echo "    $PASS_FILE" >&2
+  echo "  On Omarchy that password also unlocks your disk (LUKS) and sudo." >&2
+  echo "  Any future root compromise reads it outright; without this feature a root" >&2
+  echo "  attacker still needs your keyring unlocked in memory. The file sits" >&2
+  echo "  inside your encrypted disk, is never fed to ssh or cron sessions, and" >&2
+  echo "  uninstall deletes it — but while it exists this is a real weakening of" >&2
+  echo "  the secret chain. The default (no auto-unlock) keeps the boundary:" >&2
+  echo "  fingerprint logins simply show the keyring unlock prompt once per session." >&2
+  echo >&2
+}
+
 enable_auto_unlock() {
   if auto_unlock_enabled && [[ -f $UNLOCK_DST && -f $PASS_FILE ]]; then
     ok "keyring auto-unlock already configured"
     return 0
   fi
 
-  echo "  ${BOLD}This stores your keyring password in a root-only file${RESET} ($PASS_FILE)." >&2
-  echo "  On Omarchy that password also unlocks your disk and sudo. It sits inside" >&2
-  echo "  your encrypted disk and only root can read it — but it is a plaintext" >&2
-  echo "  copy of a high-value secret. It is only ever fed to your own keyring" >&2
-  echo "  daemon at the SDDM graphical login, never to ssh or cron sessions." >&2
-  echo
+  print_auto_unlock_warning
+  # Both consent points default to "no": a bare Enter never enables this.
+  if [[ -t 0 ]] && command -v gum >/dev/null 2>&1; then
+    gum confirm --default=false "Store the keyring password in a root-only file and enable auto-unlock?" || {
+      echo "Skipped — keeping the default: the keyring prompts once per fingerprint login." >&2
+      return 1
+    }
+  fi
 
   command -v gum >/dev/null 2>&1 || die "gum not found — auto-unlock needs a terminal prompt"
   local pw confirm
@@ -305,13 +322,16 @@ do_apply() {
 
   migrate_keyring
 
-  # Auto-unlock is only useful for fingerprint logins — password logins
-  # already unlock the keyring silently via PAM. Explicit flag, or an
-  # interactive yes; --yes alone never enables it.
+  # Auto-unlock is a separate, opt-in option and the default is OFF: without
+  # it, fingerprint logins keep the stock behavior — the keyring prompts for
+  # its password at first secret use. Password logins never need it (PAM
+  # unlocks the keyring silently), so the question is only offered to
+  # fingerprint users, and both the wizard question and the explicit warning
+  # acknowledgment default to "no". --yes alone never enables it.
   if (( auto_unlock )); then
     enable_auto_unlock || warn "auto-unlock was not configured"
-  elif (( ! yes )) && fingerprint_enrolled && command -v gum >/dev/null 2>&1; then
-    if gum confirm "Also unlock the keyring automatically for fingerprint logins? (stores the keyring password in a root-only file)"; then
+  elif (( ! yes )) && fingerprint_enrolled && command -v gum >/dev/null 2>&1 && [[ -t 0 ]]; then
+    if gum confirm --default=false "Also unlock the keyring automatically for fingerprint logins? (not recommended — plaintext password on disk)"; then
       enable_auto_unlock || warn "auto-unlock was not configured"
     fi
   fi

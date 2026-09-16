@@ -282,6 +282,28 @@ sleep 4
 status_shot=$(vm_sc "05-status")
 snap_into "$status_shot" "05-status.png" || cleanup_on_fail
 
+step "capturing the lock screen after setup"
+# omarchy-system-lock engages the Omarchy lock screen from any session
+# terminal; the lock blanks the display ~5s after engaging, so the shot must
+# land inside that window (a stray keystroke re-wakes it if missed).
+vm_type "omarchy-system-lock"
+vm_key ret
+sleep 3
+lock_shot=$(vm_sc "06-lock-screen")
+if [[ -z $(vm_ocr "$lock_shot" | tr -d '[:space:]') ]]; then
+  sleep 1
+  lock_shot=$(vm_sc "06-lock-screen")
+fi
+snap_into "$lock_shot" "06-lock-screen.png" || cleanup_on_fail
+ok "lock screen captured (password prompt — the default experience)"
+
+# Unlocking with the login password proves the lock screen flow still works
+# end-to-end after everything the utility changed.
+vm_type "$VM_PASSWORD"
+vm_key ret
+shot=$(wait_text "update system|keybindings|super" 120) || { fail "lock screen did not unlock with the password"; cleanup_on_fail; }
+ok "lock screen unlocked with the login password"
+
 step "uninstalling and verifying the restoration"
 vm_ssh "echo $VM_PASSWORD | sudo -S -k ~/omarchy-secure-login/bin/omarchy-secure-login uninstall --yes" || { fail "uninstall failed"; cleanup_on_fail; }
 vm_ssh "test -f /etc/sddm.conf.d/autologin.conf" || { fail "autologin not restored"; cleanup_on_fail; }
