@@ -39,6 +39,14 @@ already unlocked with that keystroke, silently, via PAM:
   <br><em>Same desktop, same default theme — plus an encrypted keyring that unlocked with your login.</em>
 </p>
 
+Locking your session (menu → System → Lock, or your lock keybinding) looks the same as it
+always did — your password unlocks it — the utility only changed what happens at login:
+
+<p align="center">
+  <img src="screenshots/06-lock-screen.png" alt="The Omarchy lock screen asking for the password after secure login was set up" width="720">
+  <br><em>The lock screen after setup — password prompt, unchanged; validated by unlocking with it.</em>
+</p>
+
 And `omarchy-secure-login status` always tells you where you stand:
 
 <p align="center">
@@ -124,6 +132,7 @@ cd ../omarchy-secure-login && ./test/validate.sh
 - `screenshots/03-sddm-login.png` — the changed boot experience: the default Omarchy greeter asking for a password instead of autologging in
 - `screenshots/04-desktop-after-login.png` — the desktop after password login, keyring already unlocked
 - `screenshots/05-status.png` — `omarchy-secure-login status`
+- `screenshots/06-lock-screen.png` — the lock screen after setup, unlocked with the login password during the run
 
 It finishes by running `uninstall` and verifying the restoration. Limitations that cannot be exercised in QEMU: real fingerprint readers (the config path is validated by stubbing enrollment; hardware behavior is on the reader), and Bluetooth-class attacks (unrelated to this tool).
 
