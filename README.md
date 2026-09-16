@@ -139,7 +139,3 @@ It finishes by running `uninstall` and verifying the restoration. Limitations th
 ## Manual revert of the keyring
 
 If you ever want Omarchy's passwordless keyring back: export your secrets first (an app like Seahorse can show them), then `rm ~/.local/share/keyrings/login.keyring` — but be deliberate: this drops every stored secret. Chromium regenerates its own storage key; `gh auth login` re-creates its credentials.
-
-## Relationship to Omarchy
-
-This is an independent, opt-in utility. The passwordless keyring is Omarchy's deliberate default, and nothing here changes it — run the utility only if you prefer the boundary it restores.
