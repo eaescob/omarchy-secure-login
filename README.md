@@ -114,4 +114,4 @@ If you ever want Omarchy's passwordless keyring back: export your secrets first 
 
 ## Relationship to Omarchy
 
-Omarchy proper is moving toward binding the keyring to the login policy natively (see `plans/keyring-security.md` in the Omarchy repo). This utility exists for people who want the boundary today, and its code is structured so the useful pieces can be upstreamed.
+The passwordless keyring is Omarchy's deliberate default — its install scripts are written to defend it — and nothing suggests upstream intends to change that. This utility is purely opt-in for people who prefer the boundary. Design notes for what a native implementation could look like live in `plans/keyring-security.md` in our fork of the Omarchy repo; that is our proposal, not an Omarchy roadmap, though the migration code here is structured so the useful pieces could be offered upstream.
