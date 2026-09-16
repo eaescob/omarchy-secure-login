@@ -4,7 +4,7 @@ Opt-in secure login for [Omarchy](https://omarchy.org): turn off autologin, bind
 
 ## The new login experience
 
-Every screenshot below is real: captured by the [QEMU validation run](#validation) on a disposable Omarchy VM using the stock Omarchy 4.0.3 ISO with the default theme — no mockups.
+Every screenshot below is real: captured by the [QEMU validation run](#validation) on a disposable Omarchy VM using the stock Omarchy 4.0.4 ISO with the default theme — no mockups.
 
 **Before:** an encrypted Omarchy install boots through the LUKS prompt and logs you straight into the desktop, forever, without asking anything.
 
